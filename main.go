@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -12,31 +10,9 @@ import (
 	"strconv"
 	"time"
 
-	"golang.org/x/sync/errgroup"
+	"github.com/patrickfnielsen/iperf-lb/internal/proxy"
+	"github.com/patrickfnielsen/iperf-lb/internal/session"
 )
-
-type Session struct {
-	Client    string
-	IperfPort int
-	Iperf     *exec.Cmd
-}
-
-func (session *Session) containsClient(str string) bool {
-	return session.Client == str
-}
-
-type Sessions []Session
-
-func (sessions Sessions) getNextPort() int {
-	newPort := 5202
-	for _, s := range sessions {
-		if s.IperfPort >= newPort {
-			newPort = s.IperfPort + 1
-		}
-	}
-
-	return newPort
-}
 
 func main() {
 	log.Printf("Starting iperf-lb")
@@ -64,22 +40,8 @@ func getClientIp(conn net.Conn) (error, string) {
 	return fmt.Errorf("failed to get client ip address"), ""
 }
 
-func removeSession(sessions Sessions, iperf *exec.Cmd) Sessions {
-	if iperf == nil {
-		return sessions
-	}
-
-	filteredSessions := sessions[:0]
-	for _, session := range sessions {
-		if session.Iperf != iperf {
-			filteredSessions = append(filteredSessions, session)
-		}
-	}
-	return filteredSessions
-}
-
 func forward(name, from string, dialTimeout time.Duration) error {
-	var sessions Sessions
+	var allSessions *session.Sessions = &session.Sessions{}
 	l, err := net.Listen("tcp", from)
 	if err != nil {
 		return fmt.Errorf("error listening on %s %s", from, err.Error())
@@ -103,114 +65,53 @@ func forward(name, from string, dialTimeout time.Duration) error {
 		}
 
 		var upstream string
-		existingSessionFound := false
 		log.Printf("Accepted connection (%s)", fullClientAddress)
 
 		// get a iperf existing iperf service for the client, or spawn a new iperf server on the next free port
-		for _, s := range sessions {
-			if s.containsClient(clientIP) {
-				log.Printf("Found existing session [::1]:%d (%s)", s.IperfPort, fullClientAddress)
-				upstream = fmt.Sprintf("localhost:%d", s.IperfPort)
-				existingSessionFound = true
-			}
+		s, sessionFound := allSessions.GetSession(clientIP)
+		if sessionFound {
+			upstream = fmt.Sprintf("localhost:%d", s.IperfPort)
+			log.Printf("Found session [::1]:%d", s.IperfPort)
 		}
 
 		// if no session is found, spawn a new one
-		if !existingSessionFound {
-			iperfPort := sessions.getNextPort()
+		if !sessionFound {
+			iperfPort := allSessions.GetNextPort()
 			iperfCmd := exec.Command("iperf3", "-1", "-s", "-p", strconv.Itoa(iperfPort))
 			upstream = fmt.Sprintf("localhost:%d", iperfPort)
-			sessions = append(sessions, Session{
+			session := session.Session{
 				Client:    clientIP,
 				IperfPort: iperfPort,
 				Iperf:     iperfCmd,
-			})
+			}
+			*allSessions = append(*allSessions, session)
 
 			log.Printf("Spawning session [::1]:%d", iperfPort)
 
 			iperfCmd.Start()
-			time.Sleep(time.Second * 1) //TODO: REMOVE THIS
+			time.Sleep(time.Second * 1) //TODO: Checkout for correct text???
 
 			// wait for iperf to despawn and remove it from the list
 			// it despawns after a test has been run
-			go func() {
-				err := iperfCmd.Wait()
-				if err != nil {
-					log.Printf("Session exited unexpected %s\n", err.Error())
-				}
-
-				for _, s := range sessions {
-					if s.Iperf == iperfCmd {
-						log.Printf("Cleaning up session [::1]:%d", iperfPort)
-						sessions = removeSession(sessions, iperfCmd)
-					}
-				}
-			}()
+			go waitAndCleanupSession(allSessions, session)
 		}
 
 		// A separate Goroutine means the loop can accept another
 		// incoming connection on the local address
-		go connect(local, upstream, from, dialTimeout)
+		go proxy.Connect(local, upstream, from, dialTimeout)
 	}
 }
 
-// connect dials the upstream address, then copies data
-// between it and connection accepted on a local port
-func connect(local net.Conn, upstreamAddr, from string, dialTimeout time.Duration) {
-	defer local.Close()
-
-	// If Dial is used on its own, then the timeout can be as long
-	// as 2 minutes on MacOS for an unreachable host
-	upstream, err := net.DialTimeout("tcp", upstreamAddr, dialTimeout)
+func waitAndCleanupSession(sessions *session.Sessions, session session.Session) {
+	err := session.Iperf.Wait()
 	if err != nil {
-		log.Printf("error dialing %s %s", upstreamAddr, err.Error())
-		return
-	}
-	defer upstream.Close()
-
-	log.Printf("Connected %s => %s (%s)", from, upstream.RemoteAddr().String(), local.RemoteAddr().String())
-
-	ctx := context.Background()
-	if err := copy(ctx, local, upstream); err != nil && err.Error() != "done" {
-		log.Printf("error forwarding connection %s", err.Error())
+		log.Printf("Session exited unexpected %s\n", err.Error())
 	}
 
-	log.Printf("Closed %s => %s (%s)", from, upstream.RemoteAddr().String(), local.RemoteAddr().String())
-}
-
-// copy copies data between two connections using io.Copy
-// and will exit when either connection is closed or runs
-// into an error
-func copy(ctx context.Context, from, to net.Conn) error {
-	ctx, cancel := context.WithCancel(ctx)
-	errgrp, _ := errgroup.WithContext(ctx)
-	errgrp.Go(func() error {
-		io.Copy(from, to)
-		cancel()
-
-		return fmt.Errorf("done")
-	})
-
-	errgrp.Go(func() error {
-		io.Copy(to, from)
-		cancel()
-
-		return fmt.Errorf("done")
-	})
-
-	errgrp.Go(func() error {
-		<-ctx.Done()
-
-		// This closes both ends of the connection as
-		// soon as possible.
-		from.Close()
-		to.Close()
-		return fmt.Errorf("done")
-	})
-
-	if err := errgrp.Wait(); err != nil {
-		return err
+	for _, s := range *sessions {
+		if s.Iperf == session.Iperf {
+			log.Printf("Cleaning up session [::1]:%d", session.IperfPort)
+			*sessions = *sessions.RemoveSession(session)
+		}
 	}
-
-	return nil
 }
