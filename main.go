@@ -3,18 +3,22 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/patrickfnielsen/iperf-lb/internal/proxy"
 	"github.com/patrickfnielsen/iperf-lb/internal/session"
 )
 
-var IPERF_NAME = "iperf3"
+// https://github.com/esnet/iperf/blob/bd1437791a63579d589e9bea7de9250a876a5c97/src/iperf.h#L134
+const IPERF_COOKIE_SIZE = 37
+const IPERF_NAME = "iperf3"
 
 func main() {
 	log.Printf("Starting iperf-lb")
@@ -74,8 +78,22 @@ func forward(name, from string, dialTimeout time.Duration) error {
 		var upstream string
 		log.Printf("Accepted connection (%s)", fullClientAddress)
 
-		// get a iperf existing iperf service for the client, or spawn a new iperf server on the next free port
-		s, sessionFound := allSessions.GetSession(clientIP)
+		// read the iperf cookie, we use this to loadbalance iperf sessions to the same process
+		var reply strings.Builder
+		read, err := io.CopyN(&reply, local, IPERF_COOKIE_SIZE)
+		if err != nil {
+			return fmt.Errorf("could not read: %v\n", err.Error())
+		}
+
+		if read <= 0 {
+			return fmt.Errorf("got no reply from server, %+v\n", reply)
+		}
+
+		var iperfCookie = reply.String()
+		log.Printf("Read iperf cookie %s (%s)", iperfCookie, fullClientAddress)
+
+		// get an existing iperf service for the client, or spawn a new iperf server on the next free port
+		s, sessionFound := allSessions.GetSession(iperfCookie)
 		if sessionFound {
 			upstream = fmt.Sprintf("localhost:%d", s.IperfPort)
 			log.Printf("Found session [::1]:%d", s.IperfPort)
@@ -87,9 +105,10 @@ func forward(name, from string, dialTimeout time.Duration) error {
 			iperfCmd := exec.Command(IPERF_NAME, "-1", "-s", "-p", strconv.Itoa(iperfPort))
 			upstream = fmt.Sprintf("localhost:%d", iperfPort)
 			session := session.Session{
-				Client:    clientIP,
-				IperfPort: iperfPort,
-				Iperf:     iperfCmd,
+				Client:      clientIP,
+				IperfPort:   iperfPort,
+				IperfCookie: iperfCookie,
+				Iperf:       iperfCmd,
 			}
 			*allSessions = append(*allSessions, session)
 
@@ -105,7 +124,7 @@ func forward(name, from string, dialTimeout time.Duration) error {
 
 		// A separate Goroutine means the loop can accept another
 		// incoming connection on the local address
-		go proxy.Connect(local, upstream, from, dialTimeout)
+		go proxy.Connect(local, upstream, from, iperfCookie, dialTimeout)
 	}
 }
 

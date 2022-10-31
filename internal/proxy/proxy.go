@@ -13,7 +13,7 @@ import (
 
 // connect dials the upstream address, then copies data
 // between it and connection accepted on a local port
-func Connect(local net.Conn, upstreamAddr, from string, dialTimeout time.Duration) {
+func Connect(local net.Conn, upstreamAddr, from string, initalData string, dialTimeout time.Duration) {
 	defer local.Close()
 
 	// If Dial is used on its own, then the timeout can be as long
@@ -24,6 +24,10 @@ func Connect(local net.Conn, upstreamAddr, from string, dialTimeout time.Duratio
 		return
 	}
 	defer upstream.Close()
+
+	// as we might read the inital data (iperf cookie in this case early),
+	// we need to make sure its written to the upstream as well
+	upstream.Write([]byte(initalData))
 
 	log.Printf("Connected %s => %s (%s)", from, upstream.RemoteAddr().String(), local.RemoteAddr().String())
 

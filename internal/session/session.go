@@ -5,13 +5,14 @@ import (
 )
 
 type Session struct {
-	Client    string
-	IperfPort int
-	Iperf     *exec.Cmd
+	Client      string
+	IperfPort   int
+	IperfCookie string
+	Iperf       *exec.Cmd
 }
 
-func (session *Session) containsClient(str string) bool {
-	return session.Client == str
+func (session *Session) containsClient(cookie string) bool {
+	return session.IperfCookie == cookie
 }
 
 type Sessions []Session
@@ -38,9 +39,9 @@ func (sessions Sessions) RemoveSession(session Session) *Sessions {
 	return &filteredSessions
 }
 
-func (sessions Sessions) GetSession(clientIP string) (Session, bool) {
+func (sessions Sessions) GetSession(cookie string) (Session, bool) {
 	for _, s := range sessions {
-		if s.containsClient(clientIP) {
+		if s.containsClient(cookie) {
 			return s, true
 		}
 	}
