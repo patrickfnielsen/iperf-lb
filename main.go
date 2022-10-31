@@ -14,6 +14,8 @@ import (
 	"github.com/patrickfnielsen/iperf-lb/internal/session"
 )
 
+var IPERF_NAME = "iperf3"
+
 func main() {
 	log.Printf("Starting iperf-lb")
 
@@ -25,6 +27,11 @@ func main() {
 	flag.StringVar(&listen, "l", ":5201", "The ip and port to listen to, default :5201")
 	flag.DurationVar(&dialTimeout, "t", time.Millisecond*1500, "Dial timeout, default 1500 millisecond")
 	flag.Parse()
+
+	_, err := exec.LookPath(IPERF_NAME)
+	if err != nil {
+		log.Fatal("failed to find iperf3 process")
+	}
 
 	if err := forward("iperf-lb", listen, dialTimeout); err != nil {
 		log.Printf("error forwarding %s", err.Error())
@@ -77,7 +84,7 @@ func forward(name, from string, dialTimeout time.Duration) error {
 		// if no session is found, spawn a new one
 		if !sessionFound {
 			iperfPort := allSessions.GetNextPort()
-			iperfCmd := exec.Command("iperf3", "-1", "-s", "-p", strconv.Itoa(iperfPort))
+			iperfCmd := exec.Command(IPERF_NAME, "-1", "-s", "-p", strconv.Itoa(iperfPort))
 			upstream = fmt.Sprintf("localhost:%d", iperfPort)
 			session := session.Session{
 				Client:    clientIP,
