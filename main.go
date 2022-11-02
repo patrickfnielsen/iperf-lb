@@ -89,7 +89,7 @@ func forward(name, from string, dialTimeout time.Duration) error {
 			return fmt.Errorf("got no reply from server, %+v\n", reply)
 		}
 
-		var iperfCookie = reply.String()
+		iperfCookie := reply.String()
 		log.Printf("Read iperf cookie %s (%s)", iperfCookie, fullClientAddress)
 
 		// get an existing iperf service for the client, or spawn a new iperf server on the next free port
@@ -102,7 +102,7 @@ func forward(name, from string, dialTimeout time.Duration) error {
 		// if no session is found, spawn a new one
 		if !sessionFound {
 			iperfPort := allSessions.GetNextPort()
-			iperfCmd := exec.Command(IPERF_NAME, "-1", "-s", "-p", strconv.Itoa(iperfPort))
+			iperfCmd := exec.Command(IPERF_NAME, "--forceflush", "-1", "-s", "-p", strconv.Itoa(iperfPort))
 			upstream = fmt.Sprintf("localhost:%d", iperfPort)
 			session := session.Session{
 				Client:      clientIP,
@@ -114,8 +114,10 @@ func forward(name, from string, dialTimeout time.Duration) error {
 
 			log.Printf("Spawning session [::1]:%d", iperfPort)
 
-			iperfCmd.Start()
-			time.Sleep(time.Second * 1) //TODO: Checkout for correct text???
+			err = startProcessAndWaitForReady(iperfCmd, "Server listening")
+			if err != nil {
+				return err
+			}
 
 			// wait for iperf to despawn and remove it from the list
 			// it despawns after a test has been run
@@ -125,6 +127,31 @@ func forward(name, from string, dialTimeout time.Duration) error {
 		// A separate Goroutine means the loop can accept another
 		// incoming connection on the local address
 		go proxy.Connect(local, upstream, from, iperfCookie, dialTimeout)
+	}
+}
+
+func startProcessAndWaitForReady(iperfCmd *exec.Cmd, readyString string) error {
+	// reader for command output, used to check that the process is ready
+	stdout, err := iperfCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to listen to iperf output")
+	}
+
+	// start the iperf process and wait for the correct output
+	if err = iperfCmd.Start(); err != nil {
+		return err
+	}
+
+	for {
+		tmp := make([]byte, 1024)
+		_, err := stdout.Read(tmp)
+		if err != nil {
+			return fmt.Errorf("failed to read iperf output: %s", err)
+		}
+
+		if strings.Contains(string(tmp), readyString) {
+			return nil
+		}
 	}
 }
 
