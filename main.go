@@ -20,13 +20,14 @@ import (
 const IPERF_COOKIE_SIZE = 37
 const IPERF_NAME = "iperf3"
 
+var (
+	listen      string
+	dialTimeout time.Duration
+	sessions    session.Sessions = session.Sessions{}
+)
+
 func main() {
 	log.Printf("Starting iperf-lb")
-
-	var (
-		listen      string
-		dialTimeout time.Duration
-	)
 
 	flag.StringVar(&listen, "l", ":5201", "The ip and port to listen to, default :5201")
 	flag.DurationVar(&dialTimeout, "t", time.Millisecond*1500, "Dial timeout, default 1500 millisecond")
@@ -37,22 +38,21 @@ func main() {
 		log.Fatal("failed to find iperf3 process")
 	}
 
-	if err := forward("iperf-lb", listen, dialTimeout); err != nil {
+	if err := forward(listen, dialTimeout); err != nil {
 		log.Printf("error forwarding %s", err.Error())
 		os.Exit(1)
 	}
 }
 
-func getClientIp(conn net.Conn) (error, string) {
+func getClientIp(conn net.Conn) (string, error) {
 	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
-		return nil, addr.IP.String()
+		return addr.IP.String(), nil
 	}
 
-	return fmt.Errorf("failed to get client ip address"), ""
+	return "", fmt.Errorf("failed to get client ip address")
 }
 
-func forward(name, from string, dialTimeout time.Duration) error {
-	var allSessions *session.Sessions = &session.Sessions{}
+func forward(from string, dialTimeout time.Duration) error {
 	l, err := net.Listen("tcp", from)
 	if err != nil {
 		return fmt.Errorf("error listening on %s %s", from, err.Error())
@@ -70,30 +70,30 @@ func forward(name, from string, dialTimeout time.Duration) error {
 		}
 
 		fullClientAddress := local.RemoteAddr().String()
-		err, clientIP := getClientIp(local)
+		clientIP, err := getClientIp(local)
 		if err != nil {
 			return err
 		}
 
-		var upstream string
 		log.Printf("Accepted connection (%s)", fullClientAddress)
 
 		// read the iperf cookie, we use this to loadbalance iperf sessions to the same process
 		var reply strings.Builder
 		read, err := io.CopyN(&reply, local, IPERF_COOKIE_SIZE)
 		if err != nil {
-			return fmt.Errorf("could not read: %v\n", err.Error())
+			return fmt.Errorf("could not read: %v", err.Error())
 		}
 
 		if read <= 0 {
-			return fmt.Errorf("got no reply from server, %+v\n", reply)
+			return fmt.Errorf("got no reply from server, %+v", reply)
 		}
 
 		iperfCookie := reply.String()
 		log.Printf("Read iperf cookie %s (%s)", iperfCookie, fullClientAddress)
 
 		// get an existing iperf service for the client, or spawn a new iperf server on the next free port
-		s, sessionFound := allSessions.GetSession(iperfCookie)
+		var upstream string
+		s, sessionFound := sessions.Get(iperfCookie)
 		if sessionFound {
 			upstream = fmt.Sprintf("localhost:%d", s.IperfPort)
 			log.Printf("Found session [::1]:%d", s.IperfPort)
@@ -101,7 +101,7 @@ func forward(name, from string, dialTimeout time.Duration) error {
 
 		// if no session is found, spawn a new one
 		if !sessionFound {
-			iperfPort := allSessions.GetNextPort()
+			iperfPort := sessions.GetNextPort()
 			iperfCmd := exec.Command(IPERF_NAME, "--forceflush", "-1", "-s", "-p", strconv.Itoa(iperfPort))
 			upstream = fmt.Sprintf("localhost:%d", iperfPort)
 			session := session.Session{
@@ -110,7 +110,7 @@ func forward(name, from string, dialTimeout time.Duration) error {
 				IperfCookie: iperfCookie,
 				Iperf:       iperfCmd,
 			}
-			*allSessions = append(*allSessions, session)
+			sessions.Add(session)
 
 			log.Printf("Spawning session [::1]:%d", iperfPort)
 
@@ -121,7 +121,7 @@ func forward(name, from string, dialTimeout time.Duration) error {
 
 			// wait for iperf to despawn and remove it from the list
 			// it despawns after a test has been run
-			go waitAndCleanupSession(allSessions, session)
+			go waitAndCleanupSession(session)
 		}
 
 		// A separate Goroutine means the loop can accept another
@@ -155,16 +155,12 @@ func startProcessAndWaitForReady(iperfCmd *exec.Cmd, readyString string) error {
 	}
 }
 
-func waitAndCleanupSession(sessions *session.Sessions, session session.Session) {
+func waitAndCleanupSession(session session.Session) {
 	err := session.Iperf.Wait()
 	if err != nil {
 		log.Printf("Session exited unexpected %s\n", err.Error())
 	}
 
-	for _, s := range *sessions {
-		if s.Iperf == session.Iperf {
-			log.Printf("Cleaning up session [::1]:%d", session.IperfPort)
-			*sessions = *sessions.RemoveSession(session)
-		}
-	}
+	log.Printf("Cleaning up session [::1]:%d", session.IperfPort)
+	sessions.Remove(session)
 }

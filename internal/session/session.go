@@ -2,6 +2,7 @@ package session
 
 import (
 	"os/exec"
+	"sync"
 )
 
 type Session struct {
@@ -15,11 +16,14 @@ func (session *Session) containsClient(cookie string) bool {
 	return session.IperfCookie == cookie
 }
 
-type Sessions []Session
+type Sessions struct {
+	mu       sync.Mutex
+	sessions []Session
+}
 
-func (sessions Sessions) GetNextPort() int {
+func (s *Sessions) GetNextPort() int {
 	newPort := 5202
-	for _, s := range sessions {
+	for _, s := range s.sessions {
 		if s.IperfPort >= newPort {
 			newPort = s.IperfPort + 1
 		}
@@ -28,23 +32,35 @@ func (sessions Sessions) GetNextPort() int {
 	return newPort
 }
 
-func (sessions Sessions) RemoveSession(session Session) *Sessions {
-	filteredSessions := sessions[:0]
-	for _, s := range sessions {
-		if s != session {
-			filteredSessions = append(filteredSessions, session)
-		}
-	}
-
-	return &filteredSessions
-}
-
-func (sessions Sessions) GetSession(cookie string) (Session, bool) {
-	for _, s := range sessions {
+func (s *Sessions) Get(cookie string) (Session, bool) {
+	for _, s := range s.sessions {
 		if s.containsClient(cookie) {
 			return s, true
 		}
 	}
 
 	return Session{}, false
+}
+
+func (s *Sessions) Count() int {
+	return len(s.sessions)
+}
+
+func (s *Sessions) Remove(session Session) {
+	s.mu.Lock()
+	filteredSessions := s.sessions[:0]
+	for _, s := range s.sessions {
+		if s != session {
+			filteredSessions = append(filteredSessions, s)
+		}
+	}
+
+	s.sessions = filteredSessions
+	s.mu.Unlock()
+}
+
+func (s *Sessions) Add(session Session) {
+	s.mu.Lock()
+	s.sessions = append(s.sessions, session)
+	s.mu.Unlock()
 }
