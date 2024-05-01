@@ -12,8 +12,14 @@ import (
 	"strings"
 	"time"
 
+	"net/http"
+
 	"github.com/patrickfnielsen/iperf-lb/internal/proxy"
 	"github.com/patrickfnielsen/iperf-lb/internal/session"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // https://github.com/esnet/iperf/blob/bd1437791a63579d589e9bea7de9250a876a5c97/src/iperf.h#L134
@@ -21,17 +27,37 @@ const IPERF_COOKIE_SIZE = 37
 const IPERF_NAME = "iperf3"
 
 var (
-	listen      string
-	dialTimeout time.Duration
-	sessions    session.Sessions = session.Sessions{}
+	promSessionsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "iperflb_sessions_total",
+		Help: "The total number of iperf session spawned",
+	})
+	promSessionsCurrent = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "iperflb_sessions_current",
+		Help: "The current number of iperf sessions",
+	})
+)
+
+var (
+	listen        string
+	enableMetrics bool
+	dialTimeout   time.Duration
+	sessions      session.Sessions = session.Sessions{}
 )
 
 func main() {
 	log.Printf("Starting iperf-lb")
 
 	flag.StringVar(&listen, "l", ":5201", "The ip and port to listen to, default :5201")
+	flag.BoolVar(&enableMetrics, "metrics", false, "Set to enable prometheus metrics on :2112")
 	flag.DurationVar(&dialTimeout, "t", time.Millisecond*1500, "Dial timeout, default 1500 millisecond")
 	flag.Parse()
+
+	if enableMetrics {
+		http.Handle("/metrics", promhttp.Handler())
+		go http.ListenAndServe(":2112", nil)
+
+		log.Print("Listening for metrics on [::]:2112")
+	}
 
 	_, err := exec.LookPath(IPERF_NAME)
 	if err != nil {
@@ -42,14 +68,6 @@ func main() {
 		log.Printf("error forwarding %s", err.Error())
 		os.Exit(1)
 	}
-}
-
-func getClientIp(conn net.Conn) (string, error) {
-	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
-		return addr.IP.String(), nil
-	}
-
-	return "", fmt.Errorf("failed to get client ip address")
 }
 
 func forward(from string, dialTimeout time.Duration) error {
@@ -130,6 +148,14 @@ func forward(from string, dialTimeout time.Duration) error {
 	}
 }
 
+func getClientIp(conn net.Conn) (string, error) {
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP.String(), nil
+	}
+
+	return "", fmt.Errorf("failed to get client ip address")
+}
+
 func startProcessAndWaitForReady(iperfCmd *exec.Cmd, readyString string) error {
 	// reader for command output, used to check that the process is ready
 	stdout, err := iperfCmd.StdoutPipe()
@@ -141,6 +167,9 @@ func startProcessAndWaitForReady(iperfCmd *exec.Cmd, readyString string) error {
 	if err = iperfCmd.Start(); err != nil {
 		return err
 	}
+
+	promSessionsCurrent.Inc()
+	promSessionsTotal.Inc()
 
 	for {
 		tmp := make([]byte, 1024)
@@ -163,4 +192,5 @@ func waitAndCleanupSession(session session.Session) {
 
 	log.Printf("Cleaning up session [::1]:%d", session.IperfPort)
 	sessions.Remove(session)
+	promSessionsCurrent.Dec()
 }
